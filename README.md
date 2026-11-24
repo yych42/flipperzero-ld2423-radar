@@ -161,3 +161,9 @@ void loop() {
 ```
 
 *(Note: Avoid strapping/USB pins such as `GPIO 0`, `GPIO 19`, and `GPIO 20` on the ESP32-S2 when picking UART GPIOs.)*
+
+---
+
+## Credits & License
+
+Originally adapted from [TownOfBulls/flipperzero-ld2450-radar](https://github.com/TownOfBulls/flipperzero-ld2450-radar) (by Villatoro). Licensed under the [MIT License](LICENSE).
