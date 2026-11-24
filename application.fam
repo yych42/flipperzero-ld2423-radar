@@ -1,17 +1,19 @@
 # For details & more options, see documentation/AppManifests.md in firmware repo
 
 App(
-    appid="ld2450_radar",  # Must be unique
-    name="App ld2450_radar",  # Displayed in menus
+    appid="ld2423_radar",
+    name="LD2423 Radar",
     apptype=FlipperAppType.EXTERNAL,
-    entry_point="ld2450_radar_app",
-    stack_size=2 * 1024,
+    entry_point="ld2423_radar_app",
+    stack_size=4 * 1024,
     fap_category="GPIO",
-    # Optional values
-    # fap_version="0.1",
-    fap_icon="ld2450_radar.png",  # 10x10 1-bit PNG
-    # fap_description="A simple app",
-    # fap_author="Villatoro",
-    # fap_weburl="https://github.com/user/ld2450_radar",
-    fap_icon_assets="images",  # Image assets to compile for this application
+    fap_version="1.0",
+    fap_icon="ld2423_radar.png",
+    fap_description="HLK-LD2423 24GHz multi-target mmWave radar scope, telemetry & config",
+    fap_author="LD2423 Radar",
+    sources=[
+        "ld2423_radar.c",
+        "ld2423_uart.c",
+        "ld2423_protocol.c",
+    ],
 )
