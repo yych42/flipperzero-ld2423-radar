@@ -15,5 +15,6 @@ App(
         "ld2423_radar.c",
         "ld2423_uart.c",
         "ld2423_protocol.c",
+        "ld2423_filter.c",
     ],
 )

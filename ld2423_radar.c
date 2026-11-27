@@ -5,12 +5,15 @@
 #include <gui/gui.h>
 #include <input/input.h>
 #include <notification/notification_messages.h>
+#include <storage/storage.h>
+#include <toolbox/saved_struct.h>
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "ld2423_filter.h"
 #include "ld2423_protocol.h"
 #include "ld2423_uart.h"
 
@@ -22,6 +25,16 @@
 #define LD2423_STATUS_TOAST_MS    3000U
 #define LD2423_ALERT_COOLDOWN_MS  2000U
 #define LD2423_ZOOM_LEVELS        4
+
+#define LD2423_SETTINGS_PATH      APP_DATA_PATH("settings.bin")
+#define LD2423_SETTINGS_MAGIC     0x4CU
+#define LD2423_SETTINGS_VERSION   1U
+/* After a restart, the sensor is treated as back once a report arrives after
+ * a silent gap of at least this long (or after the fallback timeout). */
+#define LD2423_RESTART_GAP_MS     300U
+#define LD2423_RESTART_FALLBACK_MS 5000U
+/* Then wait this long before re-sending saved sensor settings */
+#define LD2423_REAPPLY_DELAY_MS   500U
 
 static const float ZOOM_RANGES_M[LD2423_ZOOM_LEVELS] = {2.0f, 4.0f, 6.0f, 8.0f};
 static const uint8_t ANGLE_OPTIONS[4] = {15, 30, 45, 60};
@@ -60,6 +73,7 @@ typedef enum {
     CfgRangeDist = 0,
     CfgRangeAngle,
     CfgTrackMode,
+    CfgHandheld,
     CfgUnits,
     CfgTrails,
     CfgMirrorX,
@@ -70,6 +84,24 @@ typedef enum {
     CfgFactoryReset,
     CfgItemCount,
 } ConfigItem;
+
+/* Persisted to SD (apps_data/ld2423_radar/settings.bin) */
+typedef struct {
+    uint8_t zoom_idx;
+    uint8_t baud_idx;
+    uint8_t alert_mode;
+    uint8_t sensor_range_dm;
+    uint8_t sensor_angle_deg;
+    bool imperial_units;
+    bool polar_table;
+    bool show_trails;
+    bool mirror_x;
+    bool handheld;
+    bool single_target_mode;
+    /* true once range/angle/track mode were set from this app: they are then
+     * re-applied to the sensor on launch and after every restart */
+    bool sensor_cfg_valid;
+} LD2423Settings;
 
 typedef struct {
     int16_t x_mm;
@@ -84,6 +116,7 @@ typedef struct {
 } TargetTrail;
 
 typedef struct {
+    /* Report as displayed: filtered when handheld is on, raw otherwise */
     LD2423Report report;
     TargetTrail trails[LD2423_MAX_TARGETS];
 
@@ -113,6 +146,7 @@ typedef struct {
     uint8_t sensor_range_dm;
     uint8_t sensor_angle_deg;
     bool single_target_mode;
+    bool sensor_cfg_valid;
     uint16_t last_range_res_mm;
 
     /* UI state */
@@ -122,6 +156,7 @@ typedef struct {
     bool polar_table;
     bool show_trails;
     bool mirror_x;
+    bool handheld;
     AlertMode alert_mode;
     uint8_t baud_idx;
     uint8_t cfg_cursor;
@@ -133,6 +168,15 @@ typedef struct {
     /* Command feedback toast */
     char status_msg[36];
     uint32_t status_msg_tick;
+
+    /* Short message for the Radar screen's bottom-left corner */
+    char radar_msg[20];
+    uint32_t radar_msg_tick;
+
+    /* Restart handling: re-apply saved sensor settings once it is back */
+    bool reapply_pending;
+    uint32_t restart_tick;
+    uint32_t reapply_ready_tick; /* 0 = sensor not back yet */
 } LD2423Model;
 
 typedef enum {
@@ -154,6 +198,7 @@ typedef struct {
     FuriMessageQueue* event_queue;
     FuriMutex* model_mutex;
     LD2423Model model;
+    LD2423Filter filter; /* guarded by model_mutex */
     bool otg_enabled_by_app;
     bool startup_queried;
     uint32_t start_tick;
@@ -170,6 +215,11 @@ static float u16_mm_to_unit(uint16_t mm, bool imperial) {
 static void set_status_toast(LD2423Model* m, const char* msg) {
     snprintf(m->status_msg, sizeof(m->status_msg), "%s", msg);
     m->status_msg_tick = furi_get_tick();
+}
+
+static void set_radar_toast(LD2423Model* m, const char* msg) {
+    snprintf(m->radar_msg, sizeof(m->radar_msg), "%s", msg);
+    m->radar_msg_tick = furi_get_tick();
 }
 
 static void trail_clear_all(LD2423Model* m) {
@@ -204,7 +254,22 @@ static void ld2423_on_report(const LD2423Report* report, void* context) {
     furi_mutex_acquire(app->model_mutex, FuriWaitForever);
     LD2423Model* m = &app->model;
 
-    m->report = *report;
+    if(m->reapply_pending && m->reapply_ready_tick == 0) {
+        uint32_t gap = now - m->last_packet_tick;
+        uint32_t since_restart = now - m->restart_tick;
+        /* A silent gap after the restart command means the sensor rebooted */
+        if((gap >= LD2423_RESTART_GAP_MS && since_restart >= LD2423_RESTART_GAP_MS) ||
+           since_restart >= LD2423_RESTART_FALLBACK_MS) {
+            m->reapply_ready_tick = now;
+            if(m->reapply_ready_tick == 0) m->reapply_ready_tick = 1;
+        }
+    }
+
+    if(m->handheld) {
+        ld2423_filter_update(&app->filter, report, now, &m->report);
+    } else {
+        m->report = *report;
+    }
     m->connected = true;
     m->last_packet_tick = now;
     m->packet_count++;
@@ -224,7 +289,7 @@ static void ld2423_on_report(const LD2423Report* report, void* context) {
     }
 
     for(uint8_t i = 0; i < LD2423_MAX_TARGETS; i++) {
-        const LD2423Target* t = &report->targets[i];
+        const LD2423Target* t = &m->report.targets[i];
         TargetTrail* tr = &m->trails[i];
         if(t->valid) {
             trail_push(tr, t->x_mm, t->y_mm, now);
@@ -235,13 +300,13 @@ static void ld2423_on_report(const LD2423Report* report, void* context) {
     }
 
     /* Presence arrival alert (0 -> >=1 targets) */
-    if(m->prev_active_count == 0 && report->active_count > 0 && m->alert_mode != AlertOff) {
+    if(m->prev_active_count == 0 && m->report.active_count > 0 && m->alert_mode != AlertOff) {
         if((now - m->last_alert_tick) >= LD2423_ALERT_COOLDOWN_MS) {
             trigger_alert = m->alert_mode;
             m->last_alert_tick = now;
         }
     }
-    m->prev_active_count = report->active_count;
+    m->prev_active_count = m->report.active_count;
 
     furi_mutex_release(app->model_mutex);
 
@@ -345,6 +410,92 @@ static void ld2423_send_queries(LD2423App* app) {
     furi_delay_ms(30);
     n = ld2423_build_query_range(cmd);
     ld2423_uart_send(app->uart, cmd, n);
+}
+
+/* ==================== Settings Persistence ==================== */
+
+static void ld2423_settings_save(LD2423App* app) {
+    LD2423Settings s;
+    memset(&s, 0, sizeof(s));
+
+    furi_mutex_acquire(app->model_mutex, FuriWaitForever);
+    const LD2423Model* m = &app->model;
+    s.zoom_idx = m->zoom_idx;
+    s.baud_idx = m->baud_idx;
+    s.alert_mode = (uint8_t)m->alert_mode;
+    s.sensor_range_dm = m->sensor_range_dm;
+    s.sensor_angle_deg = m->sensor_angle_deg;
+    s.imperial_units = m->imperial_units;
+    s.polar_table = m->polar_table;
+    s.show_trails = m->show_trails;
+    s.mirror_x = m->mirror_x;
+    s.handheld = m->handheld;
+    s.single_target_mode = m->single_target_mode;
+    s.sensor_cfg_valid = m->sensor_cfg_valid;
+    furi_mutex_release(app->model_mutex);
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    storage_simply_mkdir(storage, STORAGE_APP_DATA_PATH_PREFIX);
+    furi_record_close(RECORD_STORAGE);
+
+    saved_struct_save(
+        LD2423_SETTINGS_PATH, &s, sizeof(s), LD2423_SETTINGS_MAGIC, LD2423_SETTINGS_VERSION);
+}
+
+/* Call before the UART starts (no locking needed yet). */
+static void ld2423_settings_load(LD2423Model* m) {
+    LD2423Settings s;
+    if(!saved_struct_load(
+           LD2423_SETTINGS_PATH, &s, sizeof(s), LD2423_SETTINGS_MAGIC, LD2423_SETTINGS_VERSION)) {
+        return; /* first launch or unreadable: keep defaults */
+    }
+
+    if(s.zoom_idx < LD2423_ZOOM_LEVELS) m->zoom_idx = s.zoom_idx;
+    if(s.baud_idx < 2) m->baud_idx = s.baud_idx;
+    if(s.alert_mode < AlertCount) m->alert_mode = (AlertMode)s.alert_mode;
+    m->imperial_units = s.imperial_units;
+    m->polar_table = s.polar_table;
+    m->show_trails = s.show_trails;
+    m->mirror_x = s.mirror_x;
+    m->handheld = s.handheld;
+
+    if(s.sensor_cfg_valid && s.sensor_range_dm >= LD2423_MIN_RANGE_DM &&
+       s.sensor_range_dm <= LD2423_MAX_RANGE_DM && s.sensor_angle_deg >= LD2423_MIN_ANGLE_DEG &&
+       s.sensor_angle_deg <= LD2423_MAX_ANGLE_DEG) {
+        m->sensor_range_dm = s.sensor_range_dm;
+        m->sensor_angle_deg = s.sensor_angle_deg;
+        m->single_target_mode = s.single_target_mode;
+        m->sensor_cfg_valid = true;
+    }
+}
+
+/* Push saved range/angle/track mode to the sensor (if set from this app),
+ * then query FW & scope so the screens show what the sensor really has. */
+static void ld2423_apply_sensor_settings(LD2423App* app) {
+    furi_mutex_acquire(app->model_mutex, FuriWaitForever);
+    bool valid = app->model.sensor_cfg_valid;
+    uint8_t range_dm = app->model.sensor_range_dm;
+    uint8_t angle_deg = app->model.sensor_angle_deg;
+    bool single = app->model.single_target_mode;
+    furi_mutex_release(app->model_mutex);
+
+    if(valid) {
+        uint8_t cmd[LD2423_CMD_MAX_FRAME_SIZE];
+        size_t n = ld2423_build_set_range(cmd, range_dm, angle_deg);
+        ld2423_uart_send(app->uart, cmd, n);
+        furi_delay_ms(30);
+        n = ld2423_build_set_single_target(cmd, single);
+        ld2423_uart_send(app->uart, cmd, n);
+        furi_delay_ms(30);
+    }
+    ld2423_send_queries(app);
+}
+
+/* Caller holds model_mutex. */
+static void ld2423_mark_restart(LD2423Model* m) {
+    m->reapply_pending = true;
+    m->restart_tick = furi_get_tick();
+    m->reapply_ready_tick = 0;
 }
 
 /* ==================== Drawing Helpers ==================== */
@@ -544,8 +695,11 @@ static void draw_screen_radar(Canvas* canvas, const LD2423Model* m, bool stale) 
     }
     canvas_draw_str_aligned(canvas, 127, 8, AlignRight, AlignBottom, buf);
 
-    /* Bottom-left: nearest target distance & angle */
-    if(closest_idx >= 0) {
+    /* Bottom-left: status toast, else nearest target distance & angle */
+    uint32_t now_tick = furi_get_tick();
+    if(m->radar_msg[0] != '\0' && (now_tick - m->radar_msg_tick) < LD2423_STATUS_TOAST_MS) {
+        canvas_draw_str(canvas, 1, 63, m->radar_msg);
+    } else if(closest_idx >= 0) {
         const LD2423Target* ct = &m->report.targets[closest_idx];
         int8_t ang = m->mirror_x ? (int8_t)(-ct->angle_deg) : ct->angle_deg;
         if(m->imperial_units) {
@@ -688,6 +842,10 @@ static void format_config_row(
     case CfgTrackMode:
         snprintf(label, label_sz, "Track Mode");
         snprintf(val, val_sz, "%s", m->single_target_mode ? "Single(1)" : "Multi(3)");
+        break;
+    case CfgHandheld:
+        snprintf(label, label_sz, "Handheld");
+        snprintf(val, val_sz, "%s", m->handheld ? "On" : "Off");
         break;
     case CfgUnits:
         snprintf(label, label_sz, "Units");
@@ -904,6 +1062,7 @@ static void handle_config_ok(LD2423App* app) {
         uint8_t next_dm = (uint8_t)(m->sensor_range_dm + 10U);
         if(next_dm > LD2423_MAX_RANGE_DM) next_dm = LD2423_MIN_RANGE_DM;
         m->sensor_range_dm = next_dm;
+        m->sensor_cfg_valid = true;
         cmd_len = ld2423_build_set_range(cmd, m->sensor_range_dm, m->sensor_angle_deg);
         set_status_toast(m, "Setting max dist...");
         break;
@@ -917,6 +1076,7 @@ static void handle_config_ok(LD2423App* app) {
             }
         }
         m->sensor_angle_deg = next_ang;
+        m->sensor_cfg_valid = true;
         cmd_len = ld2423_build_set_range(cmd, m->sensor_range_dm, m->sensor_angle_deg);
         set_status_toast(m, "Setting max angle...");
         break;
@@ -924,10 +1084,19 @@ static void handle_config_ok(LD2423App* app) {
     case CfgTrackMode: {
         bool next_single = !m->single_target_mode;
         m->single_target_mode = next_single;
+        m->sensor_cfg_valid = true;
         cmd_len = ld2423_build_set_single_target(cmd, next_single);
         set_status_toast(m, next_single ? "Sending Single..." : "Sending Multi...");
         break;
     }
+    case CfgHandheld:
+        m->handheld = !m->handheld;
+        ld2423_filter_reset(&app->filter);
+        memset(&m->report, 0, sizeof(m->report));
+        m->prev_active_count = 0;
+        trail_clear_all(m);
+        set_status_toast(m, m->handheld ? "Handheld: On (filtered)" : "Handheld: Off (raw)");
+        break;
     case CfgUnits:
         m->imperial_units = !m->imperial_units;
         set_status_toast(m, m->imperial_units ? "Units: Feet" : "Units: Meters");
@@ -956,6 +1125,7 @@ static void handle_config_ok(LD2423App* app) {
         m->baud_idx = (uint8_t)((m->baud_idx + 1U) % 2U);
         new_uart_baud = BAUD_OPTIONS[m->baud_idx];
         m->connected = false;
+        ld2423_filter_reset(&app->filter);
         set_status_toast(m, (new_uart_baud == 115200U) ? "UART -> 115200" : "UART -> 256000");
         break;
     case CfgQueryInfo:
@@ -964,12 +1134,18 @@ static void handle_config_ok(LD2423App* app) {
         break;
     case CfgRestart:
         cmd_len = ld2423_build_restart(cmd);
+        ld2423_filter_reset(&app->filter);
         trail_clear_all(m);
+        ld2423_mark_restart(m);
         set_status_toast(m, "Restart sent");
         break;
     case CfgFactoryReset:
         cmd_len = ld2423_build_factory_reset(cmd);
+        ld2423_filter_reset(&app->filter);
         trail_clear_all(m);
+        /* Back to sensor defaults: stop re-applying saved sensor settings */
+        m->sensor_cfg_valid = false;
+        m->reapply_pending = false;
         set_status_toast(m, "Factory reset sent...");
         break;
     default:
@@ -987,6 +1163,8 @@ static void handle_config_ok(LD2423App* app) {
     if(do_query_both) {
         ld2423_send_queries(app);
     }
+
+    ld2423_settings_save(app);
 }
 
 static void handle_input(LD2423App* app, const InputEvent* in, bool* running) {
@@ -994,8 +1172,19 @@ static void handle_input(LD2423App* app, const InputEvent* in, bool* running) {
         return;
     }
 
-    if(in->key == InputKeyBack && in->type == InputTypeShort) {
-        *running = false;
+    if(in->key == InputKeyBack) {
+        /* Long Back exits from anywhere; short Back steps back to Radar first */
+        if(in->type == InputTypeLong) {
+            *running = false;
+        } else if(in->type == InputTypeShort) {
+            furi_mutex_acquire(app->model_mutex, FuriWaitForever);
+            if(app->model.screen == ScreenRadar) {
+                *running = false;
+            } else {
+                app->model.screen = ScreenRadar;
+            }
+            furi_mutex_release(app->model_mutex);
+        }
         return;
     }
 
@@ -1027,9 +1216,20 @@ static void handle_input(LD2423App* app, const InputEvent* in, bool* running) {
             }
             furi_mutex_release(app->model_mutex);
         } else if(in->type == InputTypeLong && in->key == InputKeyOk) {
+            /* Start over: restart the radar (resets its internal tracker) and
+             * forget all app-side targets, filter history and trails. */
             furi_mutex_acquire(app->model_mutex, FuriWaitForever);
             trail_clear_all(&app->model);
+            ld2423_filter_reset(&app->filter);
+            memset(&app->model.report, 0, sizeof(app->model.report));
+            app->model.prev_active_count = 0;
+            set_radar_toast(&app->model, "Restarting...");
+            ld2423_mark_restart(&app->model);
             furi_mutex_release(app->model_mutex);
+
+            uint8_t cmd[LD2423_CMD_MAX_FRAME_SIZE];
+            size_t n = ld2423_build_restart(cmd);
+            ld2423_uart_send(app->uart, cmd, n);
         }
     } else if(scr == ScreenTargets) {
         if(in->type == InputTypeShort && in->key == InputKeyOk) {
@@ -1091,9 +1291,11 @@ int32_t ld2423_radar_app(void* p) {
     app->model.zoom_idx = LD2423_ZOOM_LEVELS - 1; /* Default 8.0m full LD2423 range */
     app->model.polar_table = true;
     app->model.show_trails = true;
+    app->model.handheld = true; /* Filter handheld motion artifacts by default */
     app->model.sensor_range_dm = LD2423_MAX_RANGE_DM;
     app->model.sensor_angle_deg = LD2423_MAX_ANGLE_DEG;
     app->model.otg_5v_active = furi_hal_power_is_otg_enabled();
+    ld2423_settings_load(&app->model);
 
     app->event_queue = furi_message_queue_alloc(16, sizeof(AppEvent));
     app->model_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
@@ -1109,7 +1311,7 @@ int32_t ld2423_radar_app(void* p) {
     app->uart = ld2423_uart_alloc();
     ld2423_uart_set_callbacks(app->uart, ld2423_on_report, ld2423_on_ack, app);
 
-    if(!ld2423_uart_start(app->uart, LD2423_DEFAULT_BAUDRATE)) {
+    if(!ld2423_uart_start(app->uart, BAUD_OPTIONS[app->model.baud_idx])) {
         furi_mutex_acquire(app->model_mutex, FuriWaitForever);
         app->model.uart_init_failed = true;
         furi_mutex_release(app->model_mutex);
@@ -1131,8 +1333,22 @@ int32_t ld2423_radar_app(void* p) {
                 if(!app->startup_queried && !app->model.uart_init_failed &&
                    (furi_get_tick() - app->start_tick) >= 450U) {
                     app->startup_queried = true;
-                    ld2423_send_queries(app);
+                    ld2423_apply_sensor_settings(app);
                 }
+
+                /* Sensor is back after a restart: restore saved settings */
+                bool do_reapply = false;
+                furi_mutex_acquire(app->model_mutex, FuriWaitForever);
+                if(app->model.reapply_pending && app->model.reapply_ready_tick != 0 &&
+                   (furi_get_tick() - app->model.reapply_ready_tick) >= LD2423_REAPPLY_DELAY_MS) {
+                    app->model.reapply_pending = false;
+                    do_reapply = true;
+                    if(app->model.sensor_cfg_valid) {
+                        set_radar_toast(&app->model, "Settings restored");
+                    }
+                }
+                furi_mutex_release(app->model_mutex);
+                if(do_reapply) ld2423_apply_sensor_settings(app);
 
                 furi_mutex_acquire(app->model_mutex, FuriWaitForever);
                 app->model.rx_bytes = ld2423_uart_get_rx_bytes(app->uart);
@@ -1148,6 +1364,8 @@ int32_t ld2423_radar_app(void* p) {
 
     furi_timer_stop(timer);
     furi_timer_free(timer);
+
+    ld2423_settings_save(app);
 
     ld2423_uart_stop(app->uart);
     ld2423_uart_free(app->uart);

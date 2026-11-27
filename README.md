@@ -54,17 +54,17 @@ The HLK-LD2423 uses a **ZH1.5-4P** connector on the back of the PCB (numbered **
 
 ## Controls & Screens
 
-Use **Left / Right** at any time to cycle through all 4 screens, and **Back** to exit.
+Use **Left / Right** at any time to cycle through all 4 screens. **Back** returns to the Radar screen (or exits from Radar); **hold Back** to exit from any screen.
 
 1. **Radar** *(default)*
    - `Up` / `Down`: Zoom range (`2m` / `4m` / `6m` / `8m`)
    - `OK` (short): Toggle trajectory trails on/off
-   - `OK` (long): Clear current trails
+   - `OK` (long): Start over: restart the radar and clear all tracked targets and trails
 2. **Targets** *(live telemetry for T1–T3)*
    - `OK`: Toggle between **Polar** (`Dist`, `Angle`, `Speed` / `HOLD`) and **Cartesian** (`X`, `Y`, `Speed`)
 3. **Config** *(LD2423 & UI settings)*
    - `Up` / `Down`: Navigate settings
-   - `OK`: Adjust setting or send command (`Max Dist`, `Max Angle`, `Track Mode`, `Units`, `Trails`, `Mirror X`, `Arrival`, `UART Baud`, `Query Radar`, `Restart Radar`, `Factory Reset`)
+   - `OK`: Adjust setting or send command (`Max Dist`, `Max Angle`, `Track Mode`, `Handheld`, `Units`, `Trails`, `Mirror X`, `Arrival`, `UART Baud`, `Query Radar`, `Restart Radar`, `Factory Reset`)
 4. **Info** *(diagnostics & pinout reference)*
    - Displays firmware version, active scope, range resolution (`740 mm`), packet/error counters, Hz, baud rate, 5V OTG state, and ZH1.5-4P pinout
    - `OK`: Re-query firmware version and testing scope
@@ -88,6 +88,29 @@ The compiled `.fap` is written to `dist/ld2423_radar.fap` (category: **GPIO**).
 ```bash
 cc -std=c11 -Wall -Wextra -Werror ld2423_protocol.c tests/test_ld2423_protocol.c -lm -o /tmp/test_ld2423 && /tmp/test_ld2423
 ```
+
+Handheld filter tests:
+
+```bash
+cc -std=c11 -Wall -Wextra -Werror ld2423_filter.c tests/test_ld2423_filter.c -lm -o /tmp/test_ld2423_filter && /tmp/test_ld2423_filter
+```
+
+### Saved Settings
+
+App settings (Units, Handheld, Trails, Mirror X, Arrival, UART Baud, zoom, Targets table view) are saved to `SD Card/apps_data/ld2423_radar/settings.bin` and restored on launch.
+
+Once you change **Max Dist**, **Max Angle** or **Track Mode** from the app, those values are re-sent to the sensor on every launch and after every radar restart (long `OK` on the Radar screen, or **Config → Restart Radar**), then read back to confirm. **Factory Reset** stops this until you change them again.
+
+### Handheld Mode (default: On)
+
+The LD2423 assumes it is mounted still, so holding it by hand creates ghost targets, jitter and false "moving" flags. With **Config → Handheld** on, the app filters the sensor's targets before showing them:
+
+- A target appears only after showing up in 3 of the last 5 reports, and disappears after 3 missed reports in a row.
+- Positions are smoothed with an alpha-beta filter, which damps jitter while still keeping up with fast movers.
+- Readings that would mean moving faster than 15 m/s (faster than any sprinting human), plus one range bin of noise, are ignored. A target that stays at its new spot is picked up again after 3 reports.
+- "Still" vs. "moving" uses smoothed speed with hysteresis: still at ≤ 20 cm/s, moving at > 35 cm/s.
+
+Turn it off for a fixed mount to see the raw sensor output. Tuning constants are in `ld2423_filter.h`.
 
 ---
 
